@@ -1,10 +1,19 @@
 import os
-import glob
-import copy
-import imageio
+import imageio.v2 as imageio
 import numpy as np
-from typing import List     
+from typing import List
 import cv2
+
+
+# Rutas relativas a este script, para que funcione se lance desde donde se lance
+BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+DATA_DIR = os.path.join(BASE_DIR, "data")
+CORNERS_DIR = os.path.join(BASE_DIR, "esquinas")
+OUTPUT_CALIB = os.path.join(DATA_DIR, "camera_calibration_params.npz")
+
+CHESSBOARD_SHAPE = (7, 7)  # esquinas interiores
+SQUARE_SIZE = 20           # lado de cada casilla (mm)
+N_IMAGES = 9
 
 
 def show_image(img: np.array, img_name: str = "Image"):
@@ -35,53 +44,39 @@ def get_chessboard_points(chessboard_shape, dx, dy):
     return np.array(points, dtype=np.float32)
 
 
-imgs_path = []
-path = "data/"
-imgs_path = []
-for j in range(9):
-    imgs_path.append(path + 'camera_0' + str(j) + '.jpg')
+imgs_path = [os.path.join(DATA_DIR, f"camera_{j:02d}.jpg") for j in range(N_IMAGES)]
 print(imgs_path)
-imgs = load_images(imgs_path)
-imgs_copy = [im.copy() for im in imgs]
+imgs = load_images(imgs_path)  # imageio carga en RGB
 
-# Find corners with cv2.findChessboardCorners()
-corners = [cv2.findChessboardCornersSB(img, (7, 7)) for img in imgs]
-print("Detecciones válidas:", sum(ret for ret, _ in corners), "/", len(corners))
+# Find corners with cv2.findChessboardCornersSB()
+corners = [cv2.findChessboardCornersSB(img, CHESSBOARD_SHAPE) for img in imgs]
+valid_idx = [i for i, (found, _) in enumerate(corners) if found]
+print("Detecciones válidas:", len(valid_idx), "/", len(corners))
+for i, (found, _) in enumerate(corners):
+    if not found:
+        print(f"  Sin tablero en {os.path.basename(imgs_path[i])}: se descarta")
+if not valid_idx:
+    raise RuntimeError("No se ha detectado el tablero en ninguna imagen")
 
-corners_copy = copy.deepcopy(corners)
-criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01)
-
-
-imgs_gray = [cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) for img in imgs]
-show_image(imgs_gray[0])
-
-corners_refined = [cv2.cornerSubPix(i, cor[1], (9, 7), (-1, -1), criteria)
-                   if cor[0] else [] for i, cor in zip(imgs_gray, corners_copy)]
-
-
-for i in range(len(imgs_copy)):
-    cv2.drawChessboardCorners(
-        imgs_copy[i], (7, 7), corners[i][1], corners[i][0])
-
-
-output_folder = "esquinas"
-
-for i in range(len(imgs_copy)):
+# No se aplica cornerSubPix: findChessboardCornersSB ya da precisión subpíxel y
+# refinar encima desplaza las esquinas ~1 px y empeora el RMS
+for i in range(len(imgs)):
+    img_bgr = cv2.cvtColor(imgs[i], cv2.COLOR_RGB2BGR)  # cv2.imwrite espera BGR
+    found, cor = corners[i]
+    if found:
+        cv2.drawChessboardCorners(img_bgr, CHESSBOARD_SHAPE, cor, found)
     nombre_base = os.path.splitext(os.path.basename(imgs_path[i]))[0]
-    nuevo_nombre = f"{nombre_base}_esquinas.jpg"
+    write_image(CORNERS_DIR, f"{nombre_base}_esquinas.jpg", img_bgr)
 
-    write_image(output_folder, nuevo_nombre, imgs_copy[i])
-
-
-chessboard_points = [get_chessboard_points((7, 7), 20, 20) for img in imgs]
-
-valid_corners = [cor[1] for cor in corners if cor[0]]
-valid_corners = np.asarray(valid_corners, dtype=np.float32)
-chesboard_points_valid = [get_chessboard_points(
-    (7, 7), 20, 20) for _ in range(len(valid_corners))]
-image_size = imgs_copy[0].shape[:2]
+valid_corners = [corners[i][1] for i in valid_idx]
+chessboard_points_valid = [get_chessboard_points(CHESSBOARD_SHAPE, SQUARE_SIZE, SQUARE_SIZE)
+                           for _ in valid_idx]
+image_size = (imgs[0].shape[1], imgs[0].shape[0])  # calibrateCamera espera (ancho, alto)
+# Sin distorsión tangencial: con tableros que no cubren todo el encuadre, los
+# términos tangenciales se usan para desplazar el centro óptico de forma irreal
 rms, intrinsics, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(
-    chesboard_points_valid, valid_corners, image_size, None, None)
+    chessboard_points_valid, valid_corners, image_size, None, None,
+    flags=cv2.CALIB_ZERO_TANGENT_DIST)
 
 extrinsics = list(map(lambda rvec, tvec: np.hstack(
     (cv2.Rodrigues(rvec)[0], tvec)), rvecs, tvecs))
@@ -92,13 +87,10 @@ print("Distortion coefficients:\n", dist_coeffs)
 print("Root mean squared reprojection error:\n", rms)
 
 print("\nExtrinsics :")
-for i, ext in enumerate(extrinsics):
-    print(f"Vista {i:02d}:\n{ext}\n")
+for i, ext in zip(valid_idx, extrinsics):
+    print(f"{os.path.basename(imgs_path[i])}:\n{ext}\n")
 
 
-output_calib = "data/camera_calibration_params.npz"
-calib_size = (imgs[0].shape[1], imgs[0].shape[0])  # (ancho, alto)
-np.savez(output_calib, intrinsics=intrinsics, dist_coeffs=dist_coeffs,
-         image_size=np.array(calib_size))
-print(f"Parámetros de calibración guardados en: {output_calib}")
- 
+np.savez(OUTPUT_CALIB, intrinsics=intrinsics, dist_coeffs=dist_coeffs,
+         image_size=np.array(image_size))
+print(f"Parámetros de calibración guardados en: {OUTPUT_CALIB}")
