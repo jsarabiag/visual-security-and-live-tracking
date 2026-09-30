@@ -1,23 +1,56 @@
+import os
 import cv2
 import numpy as np
 import time
 
-CALIB_PATH = "camera_calibration_params.npz"
+CALIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "..", "data", "camera_calibration_params.npz")
 WINDOW = "LOGIN + GAME (q/ESC quit | b=select ball | h=add hole | r=reset score)"
+# (ancho, alto) de las fotos de calibración, por si el .npz no lo trae guardado
+DEFAULT_CALIB_SIZE = (1920, 1080)
 
 
 def load_calibration(path):
     try:
         data = np.load(path)
-        return data["intrinsics"], data["dist_coeffs"]
-    except Exception:
-        return None, None
+        if "image_size" in data:
+            calib_size = tuple(int(v) for v in data["image_size"])
+        else:
+            calib_size = DEFAULT_CALIB_SIZE
+        return data["intrinsics"], data["dist_coeffs"], calib_size
+    except Exception as e:
+        print(f"AVISO: no se pudo cargar la calibración ({path}): {e}")
+        print("Se continúa sin corregir la distorsión.")
+        return None, None, None
 
 
-def maybe_undistort(frame, K, dist):
+def scale_intrinsics(K, calib_size, frame_size):
+    # K está en píxeles de la resolución de calibración: se reescala a la del frame
+    sx = frame_size[0] / calib_size[0]
+    sy = frame_size[1] / calib_size[1]
+    if abs(sx - sy) > 0.01:
+        print(f"AVISO: la proporción del frame {frame_size} no coincide con la de "
+              f"calibración {calib_size}; la corrección de distorsión puede ser inexacta.")
+    K_scaled = K.astype(np.float64).copy()
+    K_scaled[0, 0] *= sx
+    K_scaled[0, 2] *= sx
+    K_scaled[1, 1] *= sy
+    K_scaled[1, 2] *= sy
+    return K_scaled
+
+
+def make_undistort_maps(K, dist, calib_size, frame_size):
     if K is None or dist is None:
+        return None
+    K_frame = scale_intrinsics(K, calib_size, frame_size)
+    return cv2.initUndistortRectifyMap(K_frame, dist, None, K_frame,
+                                       frame_size, cv2.CV_16SC2)
+
+
+def maybe_undistort(frame, maps):
+    if maps is None:
         return frame
-    return cv2.undistort(frame, K, dist)
+    return cv2.remap(frame, maps[0], maps[1], cv2.INTER_LINEAR)
 
 
 def shape_from_contour(cnt):
@@ -181,7 +214,9 @@ def detect_blue_balls_near(frame_bgr, last_center, margin):
 
 
 def main(camera_index=0, width=1280, height=720):
-    K, dist = load_calibration(CALIB_PATH)
+    K, dist, calib_size = load_calibration(CALIB_PATH)
+    undistort_maps = None
+    maps_size = None
 
     cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
@@ -234,7 +269,12 @@ def main(camera_index=0, width=1280, height=720):
         if not ret:
             break
 
-        frame = maybe_undistort(frame, K, dist)
+        # la cámara puede no respetar width/height: se usa el tamaño real del frame
+        frame_size = (frame.shape[1], frame.shape[0])
+        if frame_size != maps_size:
+            undistort_maps = make_undistort_maps(K, dist, calib_size, frame_size)
+            maps_size = frame_size
+        frame = maybe_undistort(frame, undistort_maps)
         frame = cv2.flip(frame, 1)
         display = frame.copy()
         H, W = frame.shape[:2]

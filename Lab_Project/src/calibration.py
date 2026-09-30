@@ -97,6 +97,8 @@ for i, ext in enumerate(extrinsics):
 
 
 output_calib = "data/camera_calibration_params.npz"
-np.savez(output_calib, intrinsics=intrinsics, dist_coeffs=dist_coeffs)
+calib_size = (imgs[0].shape[1], imgs[0].shape[0])  # (ancho, alto)
+np.savez(output_calib, intrinsics=intrinsics, dist_coeffs=dist_coeffs,
+         image_size=np.array(calib_size))
 print(f"Parámetros de calibración guardados en: {output_calib}")
  
