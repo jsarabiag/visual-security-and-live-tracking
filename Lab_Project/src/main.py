@@ -165,10 +165,19 @@ HIGH_BLUE = np.array([130, 255, 255])
 KERNEL_BLUE = np.ones((5, 5), np.uint8)
 
 MIN_AREA = 250
+# área del contorno / área del círculo que lo encierra: >=0.94 para una bola;
+# un rombo o cuadrado da 0.64-0.83 (el suavizado de la máscara redondea las
+# esquinas), y triángulos y manchas alargadas menos
+MIN_FILL_RATIO = 0.85
 SEARCH_MARGIN = 200
 MAX_JUMP_PX = 120
 LOST_LIMIT = 25
 INSIDE_CONFIRM_FRAMES = 8
+# si la bola reaparece en el mismo agujero en este margen, era una oclusión
+REAPPEAR_WINDOW = 60
+
+LOGIN_CONFIRM_FRAMES = 5  # frames seguidos que debe verse una figura para contar
+MSG_FRAMES = 45
 
 
 def crop_roi(img, center, margin):
@@ -201,6 +210,8 @@ def detect_blue_balls(frame_bgr):
             continue
         (x, y), r = cv2.minEnclosingCircle(c)
         if r <= 2:
+            continue
+        if area / (np.pi * r * r) < MIN_FILL_RATIO:
             continue
         circles.append((int(x), int(y), int(r)))
 
@@ -237,16 +248,25 @@ def main(camera_index=0, width=1280, height=720):
 
     mode = "LOGIN"
     step = 0
-    expected_was_present = False
+    token_counts = {}  # figura -> frames seguidos en los que se ha visto
 
     selecting_ball = False
     click_point = None
     tracked_circle = None
+    last_center = None  # última posición conocida, para volver a buscar la bola
     lost_frames = 0
     holes = []
     score = 0
     inside_history = []
-    already_scored_this_loss = False
+    pending_undo = None  # punto recién sumado que se anula si la bola reaparece
+
+    status_msg = ""
+    status_frames = 0
+
+    def set_status(msg):
+        nonlocal status_msg, status_frames
+        status_msg = msg
+        status_frames = MSG_FRAMES
 
     def dist2(a, b):
         dx = a[0] - b[0]
@@ -299,38 +319,66 @@ def main(camera_index=0, width=1280, height=720):
             cv2.putText(display, "FIGURAS",
                         (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
 
-            expected = password[step]
-            expected_present = expected in tokens
+            # Una figura sólo cuenta si se ve LOGIN_CONFIRM_FRAMES frames seguidos,
+            # para que un falso positivo de un frame no haga avanzar la secuencia
+            token_counts = {t: token_counts.get(t, 0) + 1 for t in tokens}
+            confirmed = {t for t, n in token_counts.items() if n >= LOGIN_CONFIRM_FRAMES}
 
-            if expected_present and not expected_was_present:
+            # Pueden seguir a la vista las figuras ya aceptadas; cualquier otra reinicia
+            allowed = set(password[:step + 1])
+            wrong = confirmed - allowed
+            if wrong:
+                if step > 0 or status_frames == 0:
+                    set_status("Secuencia incorrecta: retira las figuras y empieza de nuevo")
+                step = 0
+            elif password[step] in confirmed:
                 step += 1
-                expected_was_present = True
                 if step >= len(password):
                     mode = "GAME"
+                    status_frames = 0
                     selecting_ball = True
                     click_point = None
                     tracked_circle = None
+                    last_center = None
                     lost_frames = 0
                     inside_history.clear()
-                    already_scored_this_loss = False
-            elif not expected_present:
-                expected_was_present = False
+                    pending_undo = None
 
             cv2.putText(display, f"{step}/{len(password)}",
                         (20, H - 25), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+            if status_frames > 0:
+                cv2.putText(display, status_msg, (20, H - 65),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
         else:
-            if click_point is not None and tracked_circle is None:
+            if pending_undo is not None:
+                pending_undo["frames_left"] -= 1
+                if pending_undo["frames_left"] <= 0:
+                    pending_undo = None
+
+            if click_point is not None:
+                # la búsqueda de abajo coge la bola más cercana al clic; si en este
+                # frame no se ve, se sigue intentando en los siguientes
+                last_center = click_point
+                click_point = None
+                tracked_circle = None
+                lost_frames = 0
+                inside_history.clear()
+
+            if tracked_circle is None and last_center is not None and not selecting_ball:
                 circles = detect_blue_balls(frame)
                 if circles:
-                    cx0, cy0 = click_point
-                    tracked_circle = min(circles, key=lambda c: (c[0] - cx0) ** 2 + (c[1] - cy0) ** 2)
+                    lx, ly = last_center
+                    tracked_circle = min(circles, key=lambda c: (c[0] - lx) ** 2 + (c[1] - ly) ** 2)
                     lost_frames = 0
                     inside_history.clear()
-                    already_scored_this_loss = False
-                click_point = None
+                    if pending_undo is not None and point_in_rect(
+                            tracked_circle[0], tracked_circle[1], pending_undo["hole"]):
+                        score -= 1
+                        set_status("La bola sigue en la mesa: punto anulado")
+                        pending_undo = None
 
-            if tracked_circle is not None:
+            elif tracked_circle is not None:
                 cx, cy, r = tracked_circle
                 circles = detect_blue_balls_near(frame, (cx, cy), SEARCH_MARGIN)
 
@@ -349,15 +397,17 @@ def main(camera_index=0, width=1280, height=720):
                 if len(inside_history) > INSIDE_CONFIRM_FRAMES:
                     inside_history.pop(0)
 
-                if not inside_now:
-                    already_scored_this_loss = False
-
                 if lost_frames > LOST_LIMIT:
+                    cx, cy = tracked_circle[0], tracked_circle[1]
                     inside_count = sum(1 for v in inside_history if v)
                     was_inside_recently = inside_count >= (INSIDE_CONFIRM_FRAMES // 2 + 1)
-                    if was_inside_recently and not already_scored_this_loss:
+                    if was_inside_recently:
                         score += 1
-                        already_scored_this_loss = True
+                        hole = next((h for h in holes if point_in_rect(cx, cy, h)), None)
+                        if hole is not None:
+                            pending_undo = {"hole": hole, "frames_left": REAPPEAR_WINDOW}
+                    # no se deja de seguir: se busca de nuevo cerca de donde se perdió
+                    last_center = (cx, cy)
                     tracked_circle = None
                     lost_frames = 0
                     inside_history.clear()
@@ -381,8 +431,15 @@ def main(camera_index=0, width=1280, height=720):
                 cv2.putText(display, f"lost:{lost_frames}", (20, 145),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
+            elif last_center is not None and not selecting_ball:
+                cv2.putText(display, "Buscando bola...", (20, 145),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
             cv2.putText(display, f"Score: {score}", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+            if status_frames > 0:
+                cv2.putText(display, status_msg, (20, 75),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
             if selecting_ball:
                 cv2.putText(display, "Click en la bola azul...",
@@ -393,6 +450,9 @@ def main(camera_index=0, width=1280, height=720):
 
         cv2.putText(display, f"FPS: {fps:.1f}",
                     (W - 160, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        if status_frames > 0:
+            status_frames -= 1
 
         cv2.imshow(WINDOW, display)
 
@@ -405,9 +465,10 @@ def main(camera_index=0, width=1280, height=720):
                 selecting_ball = True
                 click_point = None
                 tracked_circle = None
+                last_center = None
                 lost_frames = 0
                 inside_history.clear()
-                already_scored_this_loss = False
+                pending_undo = None
 
             if key == ord('h'):
                 roi = cv2.selectROI(WINDOW, frame, showCrosshair=True, fromCenter=False)
